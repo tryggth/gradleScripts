@@ -1,0 +1,189 @@
+//TODO: Use gradle logger and remove refrences to println, scoping issues with the logger is blocking this improvement
+import groovyx.net.http.*
+import static groovyx.net.http.ContentType.*
+import static groovyx.net.http.Method.*
+
+buildscript {
+	repositories {
+		//Your dependency manager here...
+		mavenCentral()
+	}
+	dependencies {
+		classpath "org.codehaus.groovy.modules.http-builder:http-builder:0.7.1"
+	}
+}
+
+//TODO: HTTPBuilder is synchronous, for better performance use AsyncHTTPBuilder - will require stricter handling of callbacks
+class DownstreamPlugin implements Plugin<Project> {
+
+	def commitTransaction(commitUrl) {
+		def http = new HTTPBuilder(commitUrl)
+		http.request(POST, JSON) { req ->
+			response.success = { resp, data ->
+				println "Commit successful: ${resp.statusLine}"
+			}
+			response.failure = { resp, data ->
+				println "Commit failed: ${resp.statusLine}"
+			}
+		}
+		println "END TRANSACTION"
+	}
+
+	def upstreamTransaction(project, transactionUrl, commitUrl) {
+		def http = new HTTPBuilder(transactionUrl)
+
+		project.configurations.each { conf ->
+			println "Configuration ${conf.name}"
+			conf.allDependencies.each { dep ->
+				def builder = new groovy.json.JsonBuilder()
+				builder.call (
+					statements : [
+						{
+							statement "MERGE (up:Project {name:{upName}, group:{upGroup}, version: {upVersion}})"
+							parameters {
+								upName "${dep.name}"
+								upGroup "${dep.group}"
+								upVersion "${dep.version}"
+							}
+						},
+						{
+							statement "MATCH (down:Project {name:{projectName}, group:{projectGroup}, version:{projectVersion}}), (up:Project {name:{upName}, group:{upGroup}, version:{upVersion}}) MERGE (down)-[:${conf.name}]->(up)"
+							parameters {
+								projectName "${project.name}"
+								projectGroup "${project.group}"
+								projectVersion "${project.version}"
+								upName "${dep.name}"
+								upGroup "${dep.group}"
+								upVersion "${dep.version}"
+							}
+						}
+					]
+				)
+				http.request (POST, JSON) { req ->
+					body = builder.toString()
+					response.success = { resp, data ->
+						println "Success adding upstream dependency ${dep.group}:${dep.name}:${dep.version}, ${resp.statusLine}"
+					}
+					response.failure = { resp, data ->
+						println "Failure adding upstream dependency ${dep.group}:${dep.name}:${dep.version}, ${resp.statusLine}"
+					}
+				}
+			}
+		}
+
+		commitTransaction(commitUrl)
+	}
+
+	def launchReportUpstream(project) {
+		println "BEGIN TRANSACTION"
+		def http = new HTTPBuilder("http://${project.downstream.host}:${project.downstream.port}/db/data/transaction")
+
+		http.request (POST, JSON) { req ->
+			def builder = new groovy.json.JsonBuilder()
+			builder.call (
+				statements : [
+					{
+						statement "MERGE (proj:Project {name:{projectName}, group:{projectGroup}, version:{projectVersion}})"
+						parameters {
+							projectName "${project.name}"
+							projectGroup "${project.group}"
+							projectVersion "${project.version}"
+						}
+					},
+					{
+						statement "MATCH (down:Project {name:{projectName}, group:{projectGroup}, version:{projectVersion}})-[rel]->() DELETE rel"
+						parameters {
+							projectName "${project.name}"
+							projectGroup "${project.group}"
+							projectVersion "${project.version}"
+						}
+					}
+				]
+			)
+			body = builder.toString()
+			response.success = { resp, data ->
+				println "Refresh project node for ${project.name}:${project.group}:${project.version}, ${resp.statusLine}"
+				upstreamTransaction(project, resp.headers.'Location', data.commit)
+			}
+		}
+	}
+
+	void apply(Project project) {
+		project.extensions.create("downstream", DownstreamPluginExtension)
+
+		//Upload our dependencies to a neo4j server
+		project.task("reportUpstream") << {
+			try {
+				def http = new HTTPBuilder("http://${project.downstream.host}:${project.downstream.port}/db/data")
+				http.request (POST, JSON) {
+					response.success = { resp ->
+						launchReportUpstream(project)
+					}
+					response.failure = { resp -> 
+						println "Neo4j does not appear to be running on ${project.downstream.host}:${project.downstream.port}"
+					}
+				}
+			}
+			catch(UnknownHostException | ConnectException e) {
+				println "Unable to reach ${project.downstream.host}:${project.downstream.port}"
+			}
+		}
+
+		//Fetch projects who depend on us from a neo4j server
+		project.task("showDownstream") << {
+			def http = new HTTPBuilder("http://${project.downstream.host}:${project.downstream.port}/db/data/cypher")
+			try {
+				http.request( POST, JSON ) { req ->
+
+					def builder = new groovy.json.JsonBuilder()
+					builder.call ( [
+						query : "MATCH (up:Project {name:{projectName}, group:{projectGroup}, version:{projectVersion}})<-[rel]-(down) RETURN down.name, down.group, down.version, type(rel)",
+						params : {
+							projectName "${project.name}"
+							projectGroup "${project.group}"
+							projectVersion "${project.version}"
+						} ]
+					)
+					body = builder.toString()
+
+					response.success = { resp, json ->
+						println "Downstream projects from ${project.name}:${project.group}:${project.version}"
+						def depMap = [:]
+						json.data.each { d ->
+							//Force the type to be a plain old java String, not a Groovy GString, the ':' characters have special evaluation rules for a map
+							def key = new String("${d[0]}:${d[1]}:${d[2]}")
+							if(!depMap.containsKey(key)) {
+								depMap[key] = []
+							}
+							depMap[key] << d[3]
+						}
+						depMap.each { key, value ->
+							println "${key}: ${value}"
+						}
+					}
+					response.failure = { resp, json ->
+						println "Failed to retrieve downstream dependencies: ${resp.statusLine}"
+					}
+				}
+			}
+			catch(UnknownHostException | ConnectException e) {
+				println "Unable to reach ${project.downstream.host}:${project.downstream.port}"
+			}
+		}
+	}
+}
+
+class DownstreamPluginExtension {
+	//Your group's default neo4j server here
+	def host = "localhost"
+	def port = 7474
+}
+
+//Make it to where we only need to apply the plugin to the root project in multi-project builds
+if (!hasProperty("_downstreamPluginApplied")) {
+	ext["_downstreamPluginApplied"] = true
+
+	allprojects {
+		apply plugin: DownstreamPlugin
+	}
+}
