@@ -1,4 +1,4 @@
-ToastedBits Gradle Scripts and Plugins
+ToastedBits Gradle Scripts
 =============
 
 ##Downstream Plugin
